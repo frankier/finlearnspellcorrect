@@ -1,0 +1,11 @@
+[package]
+
+name = "movie_search"
+version = "0.0.1"
+authors = [ "Frankie Robertson <frankie@robertson.name>" ]
+
+[dependencies]
+fst = "0.1"
+lmdb-rs = "0.7.5"
+byteorder = "1.0.0"
+clap = "2.23.3"
