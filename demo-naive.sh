@@ -1,1 +1,1 @@
-cargo run repl index.fst postings.lmdb docs.lmdb naive
+cargo run -- --verbose repl index.fst postings.lmdb tdf.lmdb norm.lmdb docs.lmdb --method=naive --lower
