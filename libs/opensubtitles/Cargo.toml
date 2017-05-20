@@ -1,24 +1,13 @@
 [package]
 
-name = "movie_search"
+name = "opensubtitles"
 version = "0.0.1"
 authors = [ "Frankie Robertson <frankie@robertson.name>" ]
 
-[dependencies.opensubtitles]
-path="libs/opensubtitles"
-
 [dependencies]
-fst = "0.1"
-lmdb-rs = "0.7.5"
-byteorder = "1.0.0"
-clap = "2.23.3"
 itertools = "0.6.0"
-owning_ref = "0.3.3"
 minidom = "0.3.0"
 xml-rs = "0.4.1"
 flate2 = "0.2.19"
 derive-error-chain = "0.10.1"
 error-chain = "0.10.0"
-walkdir="1.0.7"
-option-filter = "1.0"
-rayon = "0.7.0"

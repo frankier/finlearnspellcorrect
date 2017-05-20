@@ -3,32 +3,45 @@ extern crate lmdb_rs as lmdb;
 extern crate byteorder;
 #[macro_use] extern crate clap;
 extern crate itertools;
+extern crate minidom;
+extern crate xml;
+extern crate flate2;
+extern crate opensubtitles;
+extern crate walkdir;
+extern crate option_filter;
+extern crate rayon;
 
 use std::error::Error;
-use std::fs::File;
+use std::fs::{File, remove_dir_all};
 use std::io::prelude::*;
 use std::io::{BufReader, BufWriter};
 use std::io;
 use std::io::Error as IoError;
-use std::path::Path;
+use std::path::{Component, Path};
 use fst::{MapBuilder, Map};
 use lmdb::{EnvBuilder, DbFlags};
-use lmdb::{ToMdbValue, FromMdbValue, MdbValue, MDB_stat};
+use lmdb::{ToMdbValue, FromMdbValue, MdbValue};
 use std::mem;
 use std::str;
 use std::slice;
-use std::fs;
 use std::cmp::Ordering;
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 use std::string::FromUtf8Error;
 use std::collections::{HashSet, HashMap};
 use itertools::Itertools;
 use std::iter::FromIterator;
+use std::iter;
+use std::fs::read_dir;
+use opensubtitles::{OpenSubtitleStream, FlatStreamBit, Word, SentDelim, SubStreamBit, DelimType};
+use walkdir::{DirEntry, WalkDir, WalkDirIterator};
+use option_filter::OptionFilterExt;
+use rayon::prelude::*;
 
 #[derive(Clone, Copy, Debug)]
 struct Posting {
     doc_idx: u64,
-    tf: u64,
+    snt_idx: u64,
+    wrd_idx: u64,
 }
 
 type PostingsList = Vec<Posting>;
@@ -75,13 +88,14 @@ impl From<FromUtf8Error> for PreindexReaderError {
 }
 
 impl<'a> Iterator for PreindexReader<'a> {
-    type Item = Result<(String, u64, u64), PreindexReaderError>;
+    type Item = Result<(String, u64, u64, u64), PreindexReaderError>;
 
-    fn next(&mut self) -> Option<Result<(String, u64, u64), PreindexReaderError>> {
-        fn read_record(mut f: &File, token_len: u64) -> Result<(String, u64, u64), PreindexReaderError> {
+    fn next(&mut self) -> Option<Result<(String, u64, u64, u64), PreindexReaderError>> {
+        fn read_record(mut f: &File, token_len: u64) -> Result<(String, u64, u64, u64), PreindexReaderError> {
             let mut buf = vec![0; token_len as usize];
             f.read_exact(buf.as_mut_slice())?;
             return Ok((String::from_utf8(buf)?,
+                       f.read_u64::<BigEndian>()?,
                        f.read_u64::<BigEndian>()?,
                        f.read_u64::<BigEndian>()?));
         }
@@ -117,7 +131,7 @@ fn del_if_exists(filename: &str) {
     }
 
     println!("Removing existing file {}", filename);
-    fs::remove_dir_all(filename).unwrap();
+    remove_dir_all(filename).unwrap();
 }
 
 fn get_env(db_fn: &str) -> lmdb::Environment {
@@ -171,99 +185,147 @@ fn read_stopwords(stopwords_fn_opt: Option<&str>) -> HashSet<String> {
     }
 }
 
-fn preindex(collection_fn: &str, preindex_fn: &str, tdf_fn: &str, norm_fn: &str,
-            docs_fn: &str, stopwords_fn_opt: Option<&str>, lowercase: bool) {
-    /// Takes three file paths. Extracts tokens from pretokenised collection_fn, sorts in-memory
-    /// and writes preliminary index to preindex_fn. Documents are writen to docs_fn.
-    let mut lines = Vec::<(String, u64, u64)>::with_capacity(1000);
+/*
+struct Meta {
 
-    new_db_txn(docs_fn, |_docs_txn, docs_db|
-        new_db_txn(norm_fn, |_norm_txn, norm_db|
-    {
-        let stopwords = read_stopwords(stopwords_fn_opt);
-        // read in collection
-        let inf = File::open(collection_fn).unwrap();
-        let inf_buf = BufReader::new(inf);
-        // Read the file contents into a string, returns `io::Result<usize>`
-        let mut lineno = 0;
-        for line_res in inf_buf.lines() {
-            let line = line_res.unwrap();
+}
 
-            docs_db.set(&lineno, &line).unwrap();
+struct Sentence {
+    id: u64,
+    words: Vec<Token>,
+}
 
-            let mut sq_sum : u64 = 0;
-            let sorted_tokens = tokenize(line.as_str(), lowercase)
-                .filter(|term| {
-                    !stopwords.contains(term.as_str())
-                }).sorted();
+enum Token {
+    Word {
+        id: u64,
+        word: String,
+    },
+    Time {
+        id: u64,
+        is_end: bool,
+        offset: Duration,
+    }
+}
+*/
 
-            sorted_tokens.into_iter()
-                // XXX: Should be able to avoid copy here
-                .group_by(|token| token.to_owned()).into_iter()
-                .map(|(token, group)| {
-                    (token, (group.count()) as u64)
-                })
-                .foreach(|(token, count)| {
-                    lines.push((token, lineno, count));
-                    sq_sum += count * count;
-                });
-            norm_db.set(&lineno, &sq_sum).unwrap();
-            lineno += 1;
+fn entry_is_subtitle(entry: &DirEntry) -> bool {
+    entry.file_type().is_file() &&
+        entry.file_name().to_str().map(|s| s.ends_with(".xml.gz")).unwrap_or(false)
+}
+
+fn id_of_path(path: &Path) -> Option<u64> {
+    let mut components = path.components();
+    components.next_back();
+    components.next_back().and_then(|comp|
+        match comp {
+            Component::Normal(path) => Some(path),
+            _ => None
+        })
+        .and_then(|path| path.to_str())
+        .and_then(|path| path.parse::<u64>().ok())
+}
+
+fn preindex(collection_dir: &str, preindex_fn: &str, tdf_fn: &str) {
+    /// Takes three file paths. Extracts tokens from xml files collection_dir, sorts in-memory and
+    /// writes preliminary index to preindex_fn. Documents are writen to docs_fn.
+
+    // read in collection
+    let walker = WalkDir::new(collection_dir).into_iter();
+    println!("Collection dir {}", collection_dir);
+    let mut seen = HashSet::new();
+    let subtitles = walker
+        .filter_map(|e| e.ok()
+        .filter(entry_is_subtitle))
+        .filter_map(|subtitle_entry| {
+            let subtitle_path = subtitle_entry.path();
+            let movie_id = id_of_path(subtitle_path).unwrap();
+            if seen.contains(&movie_id) {
+                None
+            } else {
+                seen.insert(movie_id);
+                Some((movie_id, subtitle_path.to_owned()))
+            }
+        }).collect_vec();
+
+    println!("{} candidates", subtitles.len());
+
+    let mut lines: Vec<(String, u64, u64, u64)> =
+            subtitles.par_iter().flat_map(|&(ref movie_id, ref subtitle_path)| {
+        let mut ss = OpenSubtitleStream::from_path(subtitle_path).unwrap();
+        let mut should_use = false;
+        let mut new_lines = Vec::<(String, u64, u64)>::with_capacity(100);
+        let mut cur_sent_id = 0;
+        loop {
+            match ss.next(){
+                Ok(FlatStreamBit::SubStreamBit(bit)) => match bit {
+                    SubStreamBit::SentDelim(SentDelim { id, delim_type: DelimType::Start }) => {
+                        cur_sent_id = id;
+                    }
+                    SubStreamBit::SentDelim(SentDelim { id: _, delim_type: DelimType::End }) => {
+                    }
+                    SubStreamBit::Word(Word { id, word }) => {
+                        new_lines.push((word, cur_sent_id, id));
+                    }
+                    _ => {}
+                },
+                Ok(FlatStreamBit::Meta(meta)) => {
+                    should_use = meta.get(&("source".to_owned(), "original".to_owned()))
+                        .map(|e| e.contains("Finnish"))
+                        .unwrap_or(false);
+                    if !should_use {
+                        break;
+                    }
+                }
+                Ok(FlatStreamBit::EndStream) => {
+                    break;
+                }
+                Err(e) => {
+                    println!("Skipping {}: {}", subtitle_path.to_string_lossy(), e.description());
+                    should_use = false;
+                    break;
+                }
+            }
         }
-    }));
+        // XXX: Can boxing be avoided here?
+        if should_use {
+            new_lines.into_iter().sorted().into_iter()
+                    .map(|(word, snt_idx, wrd_idx)| (word, *movie_id, snt_idx, wrd_idx)).collect_vec().into_par_iter()
+        } else {
+            vec![].into_par_iter()
+        }
+    }).collect();
 
+    println!("{} lines", lines.len());
+
+    println!("Sorting");
     // XXX: Not external and needs entire collection
     lines.sort();
 
     {
         let mut outf = open_new(preindex_fn);
-        for &(ref term, doc_idx, tf) in &lines {
+        for &(ref term, doc_idx, snt_idx, wrd_idx) in &lines {
             // term
             outf.write_u64::<BigEndian>(term.len() as u64).unwrap();
             outf.write_all(term.as_bytes()).unwrap();
             // doc index
             outf.write_u64::<BigEndian>(doc_idx).unwrap();
-            // term frequency
-            outf.write_u64::<BigEndian>(tf).unwrap();
+            // sent index
+            outf.write_u64::<BigEndian>(snt_idx).unwrap();
+            // word index
+            outf.write_u64::<BigEndian>(wrd_idx).unwrap();
         }
     }
 
     // count terms, group by term
     new_db_txn(tdf_fn, |_txn, tdf_db| {
         lines.iter()
-            .group_by(|&&(ref token, _, _)| token).into_iter()
+            .map(|&(ref token, doc_id, _, _)| (token, doc_id))
+            .group_by(|&(ref token, doc_id)| token.to_owned()).into_iter()
             .foreach(|(token, group)| {
                 let tdf = group.count() as u64;
                 tdf_db.set(&token.as_bytes(), &tdf).unwrap();
             });
     });
-}
-
-fn mkstopwords(collection_fn: &str, stopwords_fn: &str, num_stopwords: u64, lowercase: bool) {
-    // XXX: Not external and needs entire collection
-    let sorted_term_counts;
-    {
-        let mut term_counts = HashMap::<String, u64>::new();
-        let inf = File::open(collection_fn).unwrap();
-        let inf_buf = BufReader::new(inf);
-        for line_res in inf_buf.lines() {
-            for token in tokenize(line_res.unwrap().as_str(), lowercase) {
-                let count = term_counts.entry(token).or_insert(0);
-                *count += 1;
-            }
-        }
-        // XXX: Could use heap based get_top_k rather than sort here
-        sorted_term_counts = term_counts.into_iter()
-            .map(|(term, count)| (count, term))
-            .sorted_by((|a, b| a.cmp(b).reverse()));
-    }
-    {
-        let mut stopwords = open_new(stopwords_fn);
-        for &(_, ref term) in &sorted_term_counts.as_slice()[..num_stopwords as usize] {
-            stopwords.write(term.as_bytes()).unwrap();
-            stopwords.write("\n".as_bytes()).unwrap();
-        }
-    }
 }
 
 fn fstindex(preindex_fn: &str, fstindex_fn: &str, postings_fn: &str) {
@@ -278,15 +340,19 @@ fn fstindex(preindex_fn: &str, fstindex_fn: &str, postings_fn: &str) {
 
         reader
             .map(|result| result.unwrap())
-            .group_by(|&(ref term, _, _)| term.to_owned())
+            .group_by(|&(ref term, _, _, _)| term.to_owned())
             .into_iter()
             .enumerate()
             .foreach(|(idx, (term, group))| {
                 let idx = idx as u64;
                 map_builder.insert(term.as_str(), idx).unwrap();
                 let postings : PostingsList =
-                        group.map(|(_, doc_idx, tf)|
-                            Posting { doc_idx: doc_idx, tf: tf }).collect();
+                    group.map(|(_, doc_idx, snt_idx, wrd_idx)|
+                        Posting {
+                            doc_idx: doc_idx,
+                            snt_idx: snt_idx,
+                            wrd_idx: wrd_idx
+                        }).collect();
                 postings_db.set(&idx, &MdbPostingList(&postings)).unwrap();
             });
     });
@@ -305,22 +371,11 @@ fn stats(fstindex_fn: &str, postings_fn: &str) {
     });
 }
 
-fn repl(fstindex_fn: &str, postings_fn: &str, tdf_fn: &str, norm_fn: &str,
-        docs_fn: &str, stopwords_fn_opt: Option<&str>, method: &str,
-        norerank: bool, lowercase: bool, verbose: bool) {
+fn repl(fstindex_fn: &str, postings_fn: &str, lowercase: bool, verbose: bool) {
     // FST db
     let map = Map::from_path(fstindex_fn).unwrap();
     // Postings db
-    db_rdr(postings_fn, |_postings_rdr, postings_db|
-        // Docs db
-        db_rdr(docs_fn, |_docs_rdr, docs_db|
-    {
-        // read stopwords
-        let stopwords = read_stopwords(stopwords_fn_opt);
-        // count docs
-        let MDB_stat {
-            ms_entries: num_docs, ..
-        } = docs_db.stat().unwrap();
+    db_rdr(postings_fn, |_postings_rdr, postings_db| {
         // get user input
         let stdin = std::io::stdin();
         let lock = stdin.lock();
@@ -328,10 +383,7 @@ fn repl(fstindex_fn: &str, postings_fn: &str, tdf_fn: &str, norm_fn: &str,
             let input = input.unwrap();
             // XXX: Should tokenize query properly (deal with punctuation)
             // XXX: Copy here not strictly neccesary
-            let terms : Vec<String> = tokenize(input.as_str(), lowercase)
-                .filter(|term| {
-                    !stopwords.contains(term.as_str())
-                }).collect();
+            let terms = tokenize(input.as_str(), lowercase).collect_vec();
             let mut postings_lists: Vec<PostingsList> = terms.iter()
                 .map(|token| {
                     return map.get(token)
@@ -346,90 +398,24 @@ fn repl(fstindex_fn: &str, postings_fn: &str, tdf_fn: &str, norm_fn: &str,
                 println!("Please enter at least (indexed) term!");
                 continue;
             }
-            let mut sort_cmp_count = 0;
-            let mut intersect_cmp_count = 0;
-            let docs;
-            match method {
-                "naive" => {
-                    docs = intersect_many(&postings_lists, &mut intersect_cmp_count);
-                }
-                "ascending" => {
-                    let mut cmp_len = mk_cmp_len(&mut sort_cmp_count);
-                    postings_lists.sort_by(&mut (*cmp_len));
-                    docs = intersect_many(&postings_lists, &mut intersect_cmp_count);
-                }
-                _ => {
-                    println!("Invalid sort method!");
-                    return;
-                }
-            };
-            if verbose {
-                println!("Sort comparisons: {}", sort_cmp_count);
-                println!("Intersect comparisons: {}", intersect_cmp_count);
-                println!("Total comparisons: {}",
-                         sort_cmp_count + intersect_cmp_count);
-            }
+            // XXX: Process multiple terms here
+            let docs = &postings_lists[0];
             if docs.len() == 0 {
                 println!("No results!");
                 continue;
             }
-            if norerank {
-                // Print results
-                for (doc_idx, _tfs) in docs {
-                    println!("Doc {}", doc_idx);
-                    let text = docs_db.get::<String>(&doc_idx).unwrap();
-                    println!("{}", text);
-                }
-            } else {
-                let mut scores = vec![0.0; docs.len()];
-                let mut score_components = vec![vec![0.0; terms.len()]; docs.len()];
-                db_rdr(tdf_fn, |_tdf_rdr, tdf_db|
-                    db_rdr(norm_fn, |_norm_rdr, norm_db|
-                {
-                    // Calculate cosine scores
-                    let term_weight = 1.0 / (terms.len() as f64).sqrt();
-                    for (result_idx, &(ref doc_idx, ref tfs)) in docs.iter().enumerate() {
-                        for (term_idx, (term, tf)) in terms.iter().zip(tfs).enumerate() {
-                            let tdf = tdf_db.get::<u64>(term).unwrap() as f64;
-                            let tf_term = 1.0 + (*tf as f64).log(10.0);
-                            // XXX: idf term does not depend on document, only so could be moved outside this loop
-                            let idf_term = ((num_docs as f64) / tdf).log(10.0);
-                            let component = tf_term * idf_term * term_weight;
-                            score_components[result_idx][term_idx] = component;
-                            scores[result_idx] += component;
-                        }
-                        let sq_sum = norm_db.get::<u64>(doc_idx).unwrap();
-                        let norm = (sq_sum as f64).sqrt();
-                        scores[result_idx] = scores[result_idx] / norm;
-                    }
-                }));
-                // Print results
-                for ((score, score_component), (doc_idx, _tf)) in
-                        scores.iter()
-                            .zip(score_components)
-                            .zip(docs)
-                            .sorted_by(|&((score_a, _), _), &((score_b, _), _)|
-                                score_a.partial_cmp(score_b)
-                                .unwrap()
-                                .reverse())
-                {
-                    println!("Doc {}; Score {}", doc_idx, score);
-                    println!("Score components {}", itertools::join(score_component, ", "));
-                    let text = docs_db.get::<String>(&doc_idx).unwrap();
-                    println!("{}", text);
-                }
+
+            // Print results
+            for &Posting { doc_idx, snt_idx, wrd_idx } in docs {
+                println!("Match {} {} {}", doc_idx, snt_idx, wrd_idx);
+                //let text = docs_db.get::<String>(&doc_idx).unwrap();
+                //println!("{}", text);
             }
         }
-    }));
+    });
 }
 
-fn mk_cmp_len<'a>(cmp_counter: &'a mut u64) -> Box<FnMut(&PostingsList, &PostingsList) -> Ordering + 'a> {
-    return Box::new(move |v1: &PostingsList, v2: &PostingsList| {
-                        *cmp_counter += 1;
-                        v1.len().cmp(&v2.len())
-                    });
-}
-
+/*
 fn intersect_many(postings_lists: &Vec<PostingsList>, mut compares: &mut u64) -> Vec<(u64, Vec<u64>)> {
     let (head, tail) = postings_lists.split_first().unwrap();
     return tail.iter()
@@ -490,6 +476,7 @@ fn intersect2<'a, 'b, I1, I2>(pl1_it: I1, pl2_it: I2, compares: &mut u64) -> Vec
     }
     return intersected;
 }
+*/
 
 fn main() {
     let matches = clap_app!(movie_search =>
@@ -502,24 +489,12 @@ fn main() {
             (about: "Preindex a text")
             (@arg COLLECTION: +required "The input file representing the document collection")
             (@arg PREINDEX: +required "The file to output the preindex to")
-            (@arg TDF: +required "The file to output the term document frequencies to")
-            (@arg NORM: +required "The file to output the document norms to")
-            (@arg DOCS: +required "The file to write the document database to")
-            (@arg STOPWORDS: "The file to read stopwords from")
-            (@arg lowercase: -l --lower "Lowercase the index"))
+            (@arg TDF: +required "The file to output the term document frequencies to"))
         (@subcommand repl =>
             (about: ("Enter a REPL in which search terms can be entered and results will be \
                       returned."))
             (@arg FSTINDEX: +required "The file to read the FST index from")
             (@arg POSTINGS: +required "The file to read the postings list from")
-            (@arg TDF: +required "The file to read the term document frequencies from")
-            (@arg NORM: +required "The file to read the document norms from")
-            (@arg DOCS: +required "The file to read the document database from")
-            (@arg STOPWORDS: "The file to read stopwords from")
-            (@arg method: -m --method +takes_value "Method to use to compute n-way intersection")
-            // => (@possible_values: ["naive", "ascending"])
-            // XXX: Should use an enum
-            (@arg norerank: -r --norerank "Don't rerank results using tdf-idf scoring")
             (@arg lowercase: -l --lower "Lowercase the index"))
         (@subcommand stats =>
             (about: ("Read stats about the index and postings lists."))
@@ -531,23 +506,13 @@ fn main() {
             (@arg FSTINDEX: +required "The file to output the FST index")
             (@arg POSTINGS: +required "The file to output the postings list from the FST")
             (@arg stopwords: "A file containing a list of stopwords"))
-        (@subcommand mkstopwords =>
-            (about: "Produce an list of stopwords from a preindex")
-            (@arg COLLECTION: +required "The preindex to read from")
-            (@arg STOPWORDS: +required "The file to output the postings list from the FST")
-            (@arg N: "The number of stopwords to produce")
-            (@arg lowercase: -l --lower "Lowercase the stopwords"))
     ).get_matches();
 
     match matches.subcommand() {
         ("preindex", Some(sub_m)) => {
             preindex(sub_m.value_of("COLLECTION").unwrap(),
                      sub_m.value_of("PREINDEX").unwrap(),
-                     sub_m.value_of("TDF").unwrap(),
-                     sub_m.value_of("NORM").unwrap(),
-                     sub_m.value_of("DOCS").unwrap(),
-                     sub_m.value_of("STOPWORDS"),
-                     sub_m.is_present("lowercase"));
+                     sub_m.value_of("TDF").unwrap());
         }
         ("fstindex", Some(sub_m)) => {
             fstindex(sub_m.value_of("PREINDEX").unwrap(),
@@ -557,24 +522,12 @@ fn main() {
         ("repl", Some(sub_m)) => {
             repl(sub_m.value_of("FSTINDEX").unwrap(),
                  sub_m.value_of("POSTINGS").unwrap(),
-                 sub_m.value_of("TDF").unwrap(),
-                 sub_m.value_of("NORM").unwrap(),
-                 sub_m.value_of("DOCS").unwrap(),
-                 sub_m.value_of("STOPWORDS"),
-                 sub_m.value_of("method").unwrap_or("ascending"),
-                 sub_m.is_present("norerank"),
                  sub_m.is_present("lowercase"),
                  matches.is_present("verbose"));
         }
         ("stats", Some(sub_m)) => {
             stats(sub_m.value_of("FSTINDEX").unwrap(),
                   sub_m.value_of("POSTINGS").unwrap());
-        }
-        ("mkstopwords", Some(sub_m)) => {
-            mkstopwords(sub_m.value_of("COLLECTION").unwrap(),
-                        sub_m.value_of("STOPWORDS").unwrap(),
-                        value_t!(sub_m, "N", u64).unwrap_or(10),
-                        sub_m.is_present("lowercase"));
         }
         (_, _) => {
             panic!("Shan't")

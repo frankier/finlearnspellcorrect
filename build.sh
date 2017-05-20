@@ -1,3 +1,3 @@
-cargo run -- preindex movies.txt preindex.dat tdf.lmdb norm.lmdb docs.lmdb
+cargo run -- preindex ../OpenSubtitles2016/xml/fi/ preindex.dat tdf.lmdb
 cargo run -- fstindex preindex.dat index.fst postings.lmdb
 cargo run -- stats index.fst postings.lmdb
