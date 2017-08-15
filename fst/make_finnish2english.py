@@ -3,7 +3,9 @@ import sys
 import hfst
 from itertools import zip_longest
 import base64
-import charmetric
+import epitran
+import panphon
+from panphon.distance import Distance
 
 
 finnish_alphabet = [
@@ -65,7 +67,7 @@ def merge_dicts(d1, d2):
 
 def save_fst(fst, fn):
     out = hfst.HfstOutputStream(filename=fn)
-    out.write(finnish2other)
+    out.write(fst)
     out.flush()
     out.close()
 
@@ -146,7 +148,7 @@ english_consonant_phonetics.update({
 
 normalise_ipa(english_consonant_phonetics)
 
-english_phonentics = merge_dicts(
+english_phonetics = merge_dicts(
         english_consonant_phonetics,
         english_vowel_phonetics)
 
@@ -186,14 +188,22 @@ finnish_consonant_phonetics = {
     'ng': ['ŋ'],
 }
 
-finnish_phonentics = merge_dicts(
+finnish_phonetics = merge_dicts(
         finnish_consonant_phonetics,
         finnish_vowel_phonetics)
 
+double_letters = {}
+
+for letter, ipas in finnish_phonetics.items():
+    if len(letter) != 1:
+        continue
+    double_letters[letter + letter] = [
+        ipa + "ː" for ipa in ipas if len(ipa) == 1
+    ]
+
+finnish_phonetics = merge_dicts(finnish_phonetics, double_letters)
+
 # ## Make transducer
-
-ipa_chars = []
-
 
 def mk_replacer(replacements):
     replacements_re = '[{}]'.format(' | '.join(replacements))
@@ -201,37 +211,85 @@ def mk_replacer(replacements):
     return hfst.regex(replacements_re)
 
 
-def mk_lang_ipa_fst(phonentics, times, weighted=False):
+def mk_lang_ipa_fst(phonetics, weighted=False):
     replacements = []
-    # Step 1. Make Finnish -> IPA transducer
-    for written, ipas in finnish_phonentics.items():
+    for written, ipas in phonetics.items():
         for ipa in ipas:
             bits = []
-            for upper, lower in zip_longest(written, ipa, fillvalue='0'):
-                ipa_char = ('IPA' + lower)
-                ipa_chars.append(ipa_char)
-                bits.append('{}:"{}"{}'.format(upper, ipa_char, "::1" if weighted else "::0"))
+            for upper, lower in zip_longest(written, ft.ipa_segs(ipa), fillvalue='0'):
+                ipa_char = '"IPA{}"'.format(lower) if lower != '0' else '0'
+                bits.append('{}:{}{}'.format(upper, ipa_char, "::1" if weighted else "::0"))
             replacements.append(" ".join(bits))
     replacer = mk_replacer(replacements)
-    replacer.repeat_n_to_k(1, times)
+    replacer.repeat_star()
     return replacer
 
 
-finnish2other = mk_lang_ipa_fst(finnish_phonentics, 3)
+ft = panphon.FeatureTable()
 
-# Step 2. Make IPA -> English transducer
-english2ipa = mk_lang_ipa_fst(english_phonentics, 2)
-english2ipa.invert()
-save_fst(finnish2other, "finnish2otherbasic.fst")
-save_fst(english2ipa, "english2ipa.fst")
-finnish2other.compose(english2ipa)
 
-save_fst(finnish2other, "finnish2othernothingelse.fst")
+def to_segs(ipas):
+    return {seg_ipa for ipa in ipas for seg_ipa in ft.ipa_segs(ipa)}
 
-chardist_fst = charmetric.get_fst()
-save_fst(chardist_fst, "chardist_fst.fst")
-finnish2other.disjunct(chardist_fst)
-save_fst(finnish2other, "finnish2englishonce.fst")
-finnish2other.repeat_star()
 
-save_fst(finnish2other, "finnish2english.fst")
+def get_ipa_alphabet():
+    flite = epitran.flite.Flite()
+    english_ipa_alpha = set(flite.arpa_map.values())
+    finnish_ipa_alpha = {c for cc in finnish_phonetics.values() for c in cc}
+    ipa_alpha = english_ipa_alpha | finnish_ipa_alpha
+    ipa_alpha = to_segs(ipa_alpha)
+    #ipa_vowels = {sym for sym in ipa_alpha if ft.seg_dict[sym]['syl'] == 1}
+    #long_vowels = {v + 'ː' for v in ipa_vowels}
+    return ipa_alpha # | long_vowels
+
+
+distance = Distance()
+
+
+def get_subst_distance(i1, i2):
+    fti1 = ft.word_to_vector_list(i1, numeric=True)[0]
+    fti2 = ft.word_to_vector_list(i2, numeric=True)[0]
+    return distance.weighted_substitution_cost(fti1, fti2)
+
+
+def mk_ipa_replacer():
+    alphabet = get_ipa_alphabet()
+    replacements = []
+    for a1 in alphabet:
+        for a2 in alphabet:
+            ia1 = 'IPA' + a1
+            ia2 = 'IPA' + a2
+            #weight = distance.weighted_substitution_cost(ft1, ft2)
+            dist = get_subst_distance(a1, a2)
+            if dist < 1:
+                replacements.append('"{}":"{}"::{}'.format(ia1, ia2, dist * 4))
+    replacer = mk_replacer(replacements)
+    replacer.repeat_star()
+    return replacer
+
+
+def main():
+    finnish2other = mk_lang_ipa_fst(finnish_phonetics)
+
+    # Step 2. Make IPA -> English transducer
+    ipa2english = mk_lang_ipa_fst(english_phonetics)
+    ipa2english.invert()
+    ipa2finnish = finnish2other.copy()
+    ipa2finnish.invert()
+    ipa2english.disjunct(ipa2finnish)
+
+    save_fst(finnish2other, "finnish2ipa.fst")
+    save_fst(ipa2english, "ipa2english.fst")
+    ipa_wrangle = mk_ipa_replacer()
+    finnish2other.compose(ipa_wrangle)
+    save_fst(finnish2other, "finnish2wrangledipa.fst")
+
+    finnish2other.compose(ipa2english)
+    save_fst(finnish2other, "finnish2englishonce.fst")
+    finnish2other.repeat_star()
+
+    save_fst(finnish2other, "finnish2english.fst")
+
+
+if __name__ == '__main__':
+    main()
