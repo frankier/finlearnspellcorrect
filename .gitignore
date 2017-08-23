@@ -1,0 +1,12 @@
+*.fst
+*.att
+*.dot
+*.dat
+*.lmdb
+target/
+attic/
+
+__pycache__/
+venv/
+evaluation/*.pdf
+evaluation/*.pgf
