@@ -10,32 +10,37 @@ extern crate opensubtitles;
 extern crate walkdir;
 extern crate option_filter;
 extern crate rayon;
+//#[macro_use] extern crate cpp;
+extern crate fst_extra_aut as extra_aut;
+extern crate fst_levenshtein as levenshtein;
 
 use std::error::Error;
 use std::fs::{File, remove_dir_all};
 use std::io::prelude::*;
-use std::io::{BufReader, BufWriter};
+use std::io::{BufWriter};
 use std::io;
 use std::io::Error as IoError;
 use std::path::{Component, Path};
-use fst::{MapBuilder, Map};
+use fst::{MapBuilder, Map, IntoStreamer, Streamer};
+use fst::automaton::Automaton;
 use lmdb::{EnvBuilder, DbFlags};
 use lmdb::{ToMdbValue, FromMdbValue, MdbValue};
 use std::mem;
 use std::str;
 use std::slice;
-use std::cmp::Ordering;
+use std::hash::Hash;
 use byteorder::{BigEndian, WriteBytesExt, ReadBytesExt};
 use std::string::FromUtf8Error;
-use std::collections::{HashSet, HashMap};
+use std::collections::{HashSet};
 use itertools::Itertools;
-use std::iter::FromIterator;
-use std::iter;
-use std::fs::read_dir;
 use opensubtitles::{OpenSubtitleStream, FlatStreamBit, Word, SentDelim, SubStreamBit, DelimType};
-use walkdir::{DirEntry, WalkDir, WalkDirIterator};
+use walkdir::{DirEntry, WalkDir};
 use option_filter::OptionFilterExt;
 use rayon::prelude::*;
+use extra_aut::levenshtein::unweighted::SimpleLevenshtein;
+use extra_aut::levenshtein::weighted::{mk_levenshtein, get_levenshtein_weights, LevenshteinStack};
+use extra_aut::hfst::{TransducerBox, mk_stack, get_weights, AutStack};
+use extra_aut::helpers::compare_weights;
 
 #[derive(Clone, Copy, Debug)]
 struct Posting {
@@ -52,7 +57,7 @@ impl<'b> ToMdbValue for MdbPostingList<'b> {
     fn to_mdb_value<'a>(&'a self) -> MdbValue<'a> {
         unsafe {
             return MdbValue::new(std::mem::transmute(self.0.as_ptr()),
-                                 self.0.len() * mem::size_of::<u64>() * 2);
+                                 self.0.len() * mem::size_of::<u64>() * 3);
         }
     }
 }
@@ -62,7 +67,7 @@ impl<'a> FromMdbValue for MdbPostingList<'a> {
         unsafe {
             let ptr = mem::transmute(value.get_ref());
             return MdbPostingList(&slice::from_raw_parts(
-                ptr, value.get_size() / (mem::size_of::<u64>() * 2)));
+                ptr, value.get_size() / (mem::size_of::<u64>() * 3)));
         }
     }
 }
@@ -175,16 +180,6 @@ fn tokenize<'a>(line: &'a str, lowercase: bool)
         .map(if lowercase { lower_token } else { own_token });
 }
 
-fn read_stopwords(stopwords_fn_opt: Option<&str>) -> HashSet<String> {
-    if let Some(stopwords_fn) = stopwords_fn_opt {
-        HashSet::from_iter(
-            BufReader::new(File::open(stopwords_fn).unwrap())
-            .lines().map(|res| res.unwrap()))
-    } else {
-        HashSet::new()
-    }
-}
-
 /*
 struct Meta {
 
@@ -225,7 +220,7 @@ fn id_of_path(path: &Path) -> Option<u64> {
         .and_then(|path| path.parse::<u64>().ok())
 }
 
-fn preindex(collection_dir: &str, preindex_fn: &str, tdf_fn: &str) {
+fn preindex(collection_dir: &str, preindex_fn: &str, tdf_fn: &str, lowercase: bool) {
     /// Takes three file paths. Extracts tokens from xml files collection_dir, sorts in-memory and
     /// writes preliminary index to preindex_fn. Documents are writen to docs_fn.
 
@@ -264,7 +259,12 @@ fn preindex(collection_dir: &str, preindex_fn: &str, tdf_fn: &str) {
                     SubStreamBit::SentDelim(SentDelim { id: _, delim_type: DelimType::End }) => {
                     }
                     SubStreamBit::Word(Word { id, word }) => {
-                        new_lines.push((word, cur_sent_id, id));
+                        let norm_word = if lowercase {
+                            word.to_lowercase()
+                        } else {
+                            word
+                        };
+                        new_lines.push((norm_word, cur_sent_id, id));
                     }
                     _ => {}
                 },
@@ -320,7 +320,7 @@ fn preindex(collection_dir: &str, preindex_fn: &str, tdf_fn: &str) {
     new_db_txn(tdf_fn, |_txn, tdf_db| {
         lines.iter()
             .map(|&(ref token, doc_id, _, _)| (token, doc_id))
-            .group_by(|&(ref token, doc_id)| token.to_owned()).into_iter()
+            .group_by(|&(ref token, _doc_id)| token.to_owned()).into_iter()
             .foreach(|(token, group)| {
                 let tdf = group.count() as u64;
                 tdf_db.set(&token.as_bytes(), &tdf).unwrap();
@@ -357,6 +357,7 @@ fn fstindex(preindex_fn: &str, fstindex_fn: &str, postings_fn: &str) {
             });
     });
     map_builder.finish().unwrap();
+    println!("Done!");
 }
 
 fn stats(fstindex_fn: &str, postings_fn: &str) {
@@ -364,14 +365,24 @@ fn stats(fstindex_fn: &str, postings_fn: &str) {
     println!("Size of dictionary: {}", map.len());
     db_rdr(postings_fn, |_postings_rdr, postings_db| {
         let mut total_postings = 0;
+        let mut unique_docs : HashSet<u64> = HashSet::new();
         for cur in postings_db.iter().unwrap() {
-            total_postings += cur.get_value::<MdbPostingList>().0.len();
+            let postings = cur.get_value::<MdbPostingList>().0;
+            total_postings += postings.len();
+            unique_docs.extend(postings.into_iter()
+                .map(|&Posting {doc_idx, .. }| doc_idx));
         }
+        println!("Done!");
+        println!("Total number of docs: {}", unique_docs.len());
         println!("Total number of postings: {}", total_postings);
     });
 }
 
-fn repl(fstindex_fn: &str, postings_fn: &str, lowercase: bool, verbose: bool) {
+fn repl<F, A, S, GW>(fstindex_fn: &str, postings_fn: &str, lowercase: bool,
+                     dump_file: Option<&str>, verbose: bool, mk_aut: F, get_weights: GW)
+        where F: Fn(&str) -> A,
+              A: Automaton<State=S>,
+              GW: Fn(&A, &[u8]) -> f64 {
     // FST db
     let map = Map::from_path(fstindex_fn).unwrap();
     // Postings db
@@ -384,30 +395,61 @@ fn repl(fstindex_fn: &str, postings_fn: &str, lowercase: bool, verbose: bool) {
             // XXX: Should tokenize query properly (deal with punctuation)
             // XXX: Copy here not strictly neccesary
             let terms = tokenize(input.as_str(), lowercase).collect_vec();
-            let mut postings_lists: Vec<PostingsList> = terms.iter()
-                .map(|token| {
-                    return map.get(token)
-                        .map_or(vec![], |posting_id|
-                            postings_db
-                                .get::<MdbPostingList>(&posting_id)
-                                .unwrap().0.to_vec()
-                    );
-                })
-                .collect();
-            if postings_lists.len() == 0 {
-                println!("Please enter at least (indexed) term!");
+            if terms.len() == 0 {
+                println!("Please enter at least one term!");
                 continue;
             }
+            let term = terms.concat();
+            println!("{}", term);
+            let mut docs: Vec<(String, f64, Posting)> = vec![];
+            let mut corrections: Vec<(f64, String)> = vec![];
+            /*
+            // XXX: write_in_att_format needs mut!
+            let mut fsa_inner = err_model.text_to_denoised_fsa(term.as_str()).unwrap();
+            if let Some(dump_file) = dump_file {
+                // trace - write out automaton to file to:
+                // * intersect with omorfi accceptor
+                // * get set of strings matched by automaton
+                // * see dot graph
+                fsa_inner.write_in_att_format(dump_file);
+            }
+            */
+            let fsa = mk_aut(term.as_str());
+            writeln!(&mut std::io::stderr(), "FSAs done").unwrap();
+            //let fsa = SimpleLevenshtein::new(term.as_str(), 1);
+            //let fsa = Levenshtein::new(term.as_str(), 1).unwrap();
+            //let fsa1 = mk_levenshtein(term.as_str(), 2.5, 8);
+            //let fsa2 = mk_levenshtein(term.as_str(), 2.5, 8);
+            let results = map.search(&fsa);
+            let mut results_stream = results.into_stream();
+            while let Some((corrected_term, posting_id)) = results_stream.next() {
+                let postings_list = postings_db
+                    .get::<MdbPostingList>(&posting_id)
+                    .unwrap().0.to_vec();
+                let weight = get_weights(&fsa, corrected_term);
+                let correct_term_str = String::from_utf8(corrected_term.to_owned()).unwrap();
+                //println!("{} {}", correct_term_str, weight);
+                corrections.push((weight, correct_term_str.to_owned()));
+                for &posting in postings_list.iter() {
+                    docs.push((
+                        correct_term_str.to_owned(),
+                        weight,
+                        posting));
+                }
+            }
             // XXX: Process multiple terms here
-            let docs = &postings_lists[0];
             if docs.len() == 0 {
                 println!("No results!");
                 continue;
             }
-
+            corrections.sort_by(|&(ref w1, _), &(ref w2, _)| compare_weights(w1, w2));
+            for (weight, correct_term) in corrections {
+                println!("Match {} {}", correct_term, weight);
+            }
             // Print results
-            for &Posting { doc_idx, snt_idx, wrd_idx } in docs {
-                println!("Match {} {} {}", doc_idx, snt_idx, wrd_idx);
+            for (correct_term, weight, Posting { doc_idx, snt_idx, wrd_idx }) in docs {
+                //println!("Match {} {} {} {} {}", correct_term, weight, doc_idx, snt_idx, wrd_idx);
+
                 //let text = docs_db.get::<String>(&doc_idx).unwrap();
                 //println!("{}", text);
             }
@@ -489,13 +531,16 @@ fn main() {
             (about: "Preindex a text")
             (@arg COLLECTION: +required "The input file representing the document collection")
             (@arg PREINDEX: +required "The file to output the preindex to")
-            (@arg TDF: +required "The file to output the term document frequencies to"))
+            (@arg TDF: +required "The file to output the term document frequencies to")
+            (@arg lowercase: -l --lower "Lowercase the index"))
         (@subcommand repl =>
             (about: ("Enter a REPL in which search terms can be entered and results will be \
                       returned."))
             (@arg FSTINDEX: +required "The file to read the FST index from")
             (@arg POSTINGS: +required "The file to read the postings list from")
-            (@arg lowercase: -l --lower "Lowercase the index"))
+            (@arg ERROR_MODEL: +required "The file to read the error model from")
+            (@arg DUMP_FILE: "The file to dump the query FSA to")
+            (@arg lowercase: -l --lower "Lowercase the query"))
         (@subcommand stats =>
             (about: ("Read stats about the index and postings lists."))
             (@arg FSTINDEX: +required "The file to output the FST index")
@@ -512,7 +557,8 @@ fn main() {
         ("preindex", Some(sub_m)) => {
             preindex(sub_m.value_of("COLLECTION").unwrap(),
                      sub_m.value_of("PREINDEX").unwrap(),
-                     sub_m.value_of("TDF").unwrap());
+                     sub_m.value_of("TDF").unwrap(),
+                     sub_m.is_present("lowercase"));
         }
         ("fstindex", Some(sub_m)) => {
             fstindex(sub_m.value_of("PREINDEX").unwrap(),
@@ -520,10 +566,36 @@ fn main() {
                      sub_m.value_of("POSTINGS").unwrap());
         }
         ("repl", Some(sub_m)) => {
-            repl(sub_m.value_of("FSTINDEX").unwrap(),
-                 sub_m.value_of("POSTINGS").unwrap(),
-                 sub_m.is_present("lowercase"),
-                 matches.is_present("verbose"));
+            let error_model = sub_m.value_of("ERROR_MODEL").unwrap();
+            if error_model.starts_with("levenshtein-") {
+                let mut bits = error_model.splitn(2, "-");
+                bits.next().unwrap();
+                let num = bits.next().unwrap();
+                let num = num.parse::<f64>().unwrap();
+                repl(sub_m.value_of("FSTINDEX").unwrap(),
+                     sub_m.value_of("POSTINGS").unwrap(),
+                     sub_m.is_present("lowercase"),
+                     sub_m.value_of("DUMP_FILE"),
+                     matches.is_present("verbose"),
+                     |query| {
+                        mk_levenshtein(query, num, 256)
+                     },
+                     get_levenshtein_weights);
+            } else {
+                let err_model = TransducerBox::from_file(error_model)
+                    .expect("Error model not found");
+                repl(sub_m.value_of("FSTINDEX").unwrap(),
+                     sub_m.value_of("POSTINGS").unwrap(),
+                     sub_m.is_present("lowercase"),
+                     sub_m.value_of("DUMP_FILE"),
+                     matches.is_present("verbose"),
+                     |query| {
+                         mk_stack(
+                             err_model.text_to_denoised_fsa(query, false, false).unwrap(),
+                             30.0, 256)
+                     },
+                     get_weights);
+            }
         }
         ("stats", Some(sub_m)) => {
             stats(sub_m.value_of("FSTINDEX").unwrap(),

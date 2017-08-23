@@ -1,14 +1,17 @@
 [package]
-
 name = "movie_search"
 version = "0.0.1"
 authors = [ "Frankie Robertson <frankie@robertson.name>" ]
+#build = "build.rs"
 
 [dependencies.opensubtitles]
 path="libs/opensubtitles"
 
 [dependencies]
-fst = "0.1"
+fst = "0.2.3"
+#fst = { path = "/home/frankier/sourcestmp/fst" }
+fst-levenshtein = "0.1.0"
+fst-extra-aut = { path = "/home/frankier/sourcestmp/fst/fst-extra-aut" }
 lmdb-rs = "0.7.5"
 byteorder = "1.0.0"
 clap = "2.23.3"
@@ -22,3 +25,7 @@ error-chain = "0.10.0"
 walkdir="1.0.7"
 option-filter = "1.0"
 rayon = "0.7.0"
+#cpp = "0.3.0"
+
+#[build-dependencies]
+#cpp_build = "0.3.0"
