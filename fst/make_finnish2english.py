@@ -7,6 +7,15 @@ import epitran
 import panphon
 from panphon.distance import Distance
 
+IPA_SUBST_MULT = 4.0
+IPA_SUBST_CUTOFF = 1.0
+DELETE_IPA = True
+DELETE_IPA_WEIGHT = 6.0
+INSERT_IPA = True
+INSERT_IPA_WEIGHT = 6.0
+SWAP_IPA = True
+SWAP_IPA_WEIGHT = 6.0
+
 
 finnish_alphabet = [
     "a",
@@ -70,6 +79,27 @@ def save_fst(fst, fn):
     out.write(fst)
     out.flush()
     out.close()
+
+
+def apply_penalties(phonetics, penalties):
+    for letter, ipas in phonetics.items():
+        new_ipas = []
+        for ipa in ipas:
+            weight = penalties.get((letter, ipa), 0.0)
+            new_ipas.append((ipa, weight))
+        phonetics[letter] = new_ipas
+
+
+def replace(upper, lower, weight):
+    return '{}:{}::{}'.format(upper, lower, weight)
+
+
+def q(s):
+    return '"{}"'.format(s)
+
+
+def ipap(s):
+    return 'IPA' + s
 
 
 # ## English phonology
@@ -148,9 +178,15 @@ english_consonant_phonetics.update({
 
 normalise_ipa(english_consonant_phonetics)
 
+english_penalties = {}
+
 english_phonetics = merge_dicts(
         english_consonant_phonetics,
         english_vowel_phonetics)
+
+
+apply_penalties(english_phonetics, english_penalties)
+
 
 # ## Finnish phonology
 
@@ -188,6 +224,15 @@ finnish_consonant_phonetics = {
     'ng': ['ŋ'],
 }
 
+finnish_penalties = {
+    ('b', 'p'): 0.5, # fairly usual (esp older speakers)
+    ('f', 'v'): 2,  # unusual
+    ('g', 'k'): 0.5,  # fairly usual (esp older speakers)
+    ('n', 'm'): 1,  # should be context sensitive, (nasal assimilation?) onpa
+    ('w', 'v'): 0.5,
+    ('x', 'k'): 2, # should be ks instead, usually
+}
+
 finnish_phonetics = merge_dicts(
         finnish_consonant_phonetics,
         finnish_vowel_phonetics)
@@ -203,6 +248,8 @@ for letter, ipas in finnish_phonetics.items():
 
 finnish_phonetics = merge_dicts(finnish_phonetics, double_letters)
 
+apply_penalties(finnish_phonetics, finnish_penalties)
+
 # ## Make transducer
 
 def mk_replacer(replacements):
@@ -211,14 +258,20 @@ def mk_replacer(replacements):
     return hfst.regex(replacements_re)
 
 
-def mk_lang_ipa_fst(phonetics, weighted=False):
+def mk_lang_ipa_fst(phonetics, extra_weight=0.0):
     replacements = []
     for written, ipas in phonetics.items():
-        for ipa in ipas:
+        for (ipa, weight) in ipas:
             bits = []
+            first = True
             for upper, lower in zip_longest(written, ft.ipa_segs(ipa), fillvalue='0'):
-                ipa_char = '"IPA{}"'.format(lower) if lower != '0' else '0'
-                bits.append('{}:{}{}'.format(upper, ipa_char, "::1" if weighted else "::0"))
+                ipa_char = q(ipap(lower)) if lower != '0' else '0'
+                if first:
+                    trans_weight = weight + extra_weight
+                else:
+                    trans_weight = 0
+                    first = False
+                bits.append(replace(upper, ipa_char, trans_weight))
             replacements.append(" ".join(bits))
     replacer = mk_replacer(replacements)
     replacer.repeat_star()
@@ -235,7 +288,7 @@ def to_segs(ipas):
 def get_ipa_alphabet():
     flite = epitran.flite.Flite()
     english_ipa_alpha = set(flite.arpa_map.values())
-    finnish_ipa_alpha = {c for cc in finnish_phonetics.values() for c in cc}
+    finnish_ipa_alpha = {c for cc in finnish_phonetics.values() for (c, weight) in cc}
     ipa_alpha = english_ipa_alpha | finnish_ipa_alpha
     ipa_alpha = to_segs(ipa_alpha)
     #ipa_vowels = {sym for sym in ipa_alpha if ft.seg_dict[sym]['syl'] == 1}
@@ -252,36 +305,100 @@ def get_subst_distance(i1, i2):
     return distance.weighted_substitution_cost(fti1, fti2)
 
 
-def mk_ipa_replacer():
+def mk_deleter_re(alphabet, weight):
+    replacements = []
+    for a in alphabet:
+        replacements.append(replace(q(a), '0', weight))
+    return replacements
+
+
+def mk_inserter_re(alphabet, weight):
+    replacements = []
+    for a in alphabet:
+        replacements.append(replace('0', q(a), weight))
+    return replacements
+
+
+def mk_swap_re(alphabet, weight):
+    replacements = []
+    for a1 in alphabet:
+        for a2 in alphabet:
+            if a1 == a2:
+                continue
+            replacements.append("{} {}".format(
+                replace(q(a1), q(a2), weight),
+                replace(q(a2), q(a1), 0)))
+    return replacements
+
+
+def mk_replace_re(alphabet, weight):
+    replacements = []
+    for a1 in alphabet:
+        for a2 in alphabet:
+            if a1 == a2:
+                continue
+            replacements.append(
+                replace(q(a1), q(a2), weight))
+    return replacements
+
+
+def mk_ipa_replace_re():
     alphabet = get_ipa_alphabet()
     replacements = []
     for a1 in alphabet:
         for a2 in alphabet:
-            ia1 = 'IPA' + a1
-            ia2 = 'IPA' + a2
+            ia1 = ipap(a1)
+            ia2 = ipap(a2)
             #weight = distance.weighted_substitution_cost(ft1, ft2)
             dist = get_subst_distance(a1, a2)
-            if dist < 1:
-                replacements.append('"{}":"{}"::{}'.format(ia1, ia2, dist * 4))
+            if dist < IPA_SUBST_CUTOFF:
+                replacements.append(replace(q(ia1), q(ia2), dist * IPA_SUBST_MULT))
+    return replacements
+
+
+def mk_ipa_space_fst():
+    repl_re = mk_ipa_replace_re()
+    ipa_alphabet = [ipap(a) for a in get_ipa_alphabet()]
+    if DELETE_IPA:
+        del_re = mk_deleter_re(ipa_alphabet, DELETE_IPA_WEIGHT)
+    else:
+        del_re = []
+    if INSERT_IPA:
+        insert_re = mk_inserter_re(ipa_alphabet, INSERT_IPA_WEIGHT)
+    else:
+        insert_re = []
+    if SWAP_IPA:
+        swap_re = mk_swap_re(ipa_alphabet, SWAP_IPA_WEIGHT)
+    else:
+        swap_re = []
+    replacements = repl_re + del_re + insert_re + swap_re
     replacer = mk_replacer(replacements)
     replacer.repeat_star()
     return replacer
 
 
 def main():
+    print("Finnish -> IPA")
     finnish2other = mk_lang_ipa_fst(finnish_phonetics)
 
-    # Step 2. Make IPA -> English transducer
+    print("IPA -> English")
     ipa2english = mk_lang_ipa_fst(english_phonetics)
     ipa2english.invert()
+
+    print("IPA -> English/Finnish")
     ipa2finnish = finnish2other.copy()
     ipa2finnish.invert()
     ipa2english.disjunct(ipa2finnish)
 
+    print("(saving)")
     save_fst(finnish2other, "finnish2ipa.fst")
     save_fst(ipa2english, "ipa2english.fst")
-    ipa_wrangle = mk_ipa_replacer()
+
+    print("IPA wrangler")
+    ipa_wrangle = mk_ipa_space_fst()
+    print("Finnish -> wrangled IPA")
     finnish2other.compose(ipa_wrangle)
+
     save_fst(finnish2other, "finnish2wrangledipa.fst")
 
     finnish2other.compose(ipa2english)
