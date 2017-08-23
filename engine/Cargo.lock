@@ -8,7 +8,7 @@ dependencies = [
  "error-chain 0.10.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "flate2 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)",
  "fst 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)",
- "fst-extra-aut 0.1.0",
+ "fst-extra-aut 0.1.0 (git+https://github.com/frankier/fst-extra-aut?tag=uppircourse)",
  "fst-levenshtein 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "itertools 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "lmdb-rs 0.7.5 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -242,6 +242,7 @@ dependencies = [
 [[package]]
 name = "fst-extra-aut"
 version = "0.1.0"
+source = "git+https://github.com/frankier/fst-extra-aut?tag=uppircourse#e1d0a37ab03abf2f71da6d4cd5ae680d297af5d0"
 dependencies = [
  "cpp 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
  "cpp_build 0.3.0 (registry+https://github.com/rust-lang/crates.io-index)",
@@ -547,6 +548,7 @@ dependencies = [
 "checksum flate2 0.2.19 (registry+https://github.com/rust-lang/crates.io-index)" = "36df0166e856739905cd3d7e0b210fe818592211a008862599845e012d8d304c"
 "checksum fs2 0.2.5 (registry+https://github.com/rust-lang/crates.io-index)" = "bcd414e5a1a979b931bb92f41b7a54106d3f6d2e6c253e9ce943b7cd468251ef"
 "checksum fst 0.2.3 (registry+https://github.com/rust-lang/crates.io-index)" = "11e21bdd626be09f2bd66b44dbb724538176aa3549f3109208db35538dd2699f"
+"checksum fst-extra-aut 0.1.0 (git+https://github.com/frankier/fst-extra-aut?tag=uppircourse)" = "<none>"
 "checksum fst-levenshtein 0.1.0 (registry+https://github.com/rust-lang/crates.io-index)" = "0880cde495714aaa409ac3cad1ea79b3521a5a13d88af53ba50d27cf8b204c78"
 "checksum gcc 0.3.45 (registry+https://github.com/rust-lang/crates.io-index)" = "40899336fb50db0c78710f53e87afc54d8c7266fb76262fecc78ca1a7f09deae"
 "checksum itertools 0.6.0 (registry+https://github.com/rust-lang/crates.io-index)" = "772a0928a97246167d59a2a4729df5871f1327ab8b36fd24c4224b229cb47b99"

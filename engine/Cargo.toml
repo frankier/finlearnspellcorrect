@@ -9,9 +9,8 @@ path="libs/opensubtitles"
 
 [dependencies]
 fst = "0.2.3"
-#fst = { path = "/home/frankier/sourcestmp/fst" }
 fst-levenshtein = "0.1.0"
-fst-extra-aut = { path = "/home/frankier/sourcestmp/fst/fst-extra-aut" }
+fst-extra-aut = { git = "https://github.com/frankier/fst-extra-aut", tag = "uppircourse" }
 lmdb-rs = "0.7.5"
 byteorder = "1.0.0"
 clap = "2.23.3"
